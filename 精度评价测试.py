@@ -262,39 +262,120 @@ def compute_metrics(real_codes, pred_codes, class_info):
 # 6. 导出报告
 # ============================================================
 
+# ============================================================
+# 6. 导出报告（ENVI 标准格式）
+# ============================================================
+
 def export_report(cm, oa, kappa, producer, user, class_names, class_info, output_txt, output_csv):
     """
-    导出精度评价报告。
+    导出精度评价报告（ENVI 标准格式）。
+    cm: sklearn 混淆矩阵，cm[i,j] = 真实=i, 预测=j
     class_info: [(class_code, class_name, count), ...]
     """
-    # 构建带代码的显示名称
+    n = len(class_names)
     display_names = [f"{name}({code})" for code, name, _ in class_info]
 
+    # 转置矩阵以匹配 ENVI 格式（行=预测, 列=真实）
+    # cm_display[i, j] = 预测为 i, 真实为 j
+    cm_display = cm.T
+
+    # 各类别总计
+    pred_totals = cm_display.sum(axis=1)   # 预测总数（行和）
+    ref_totals = cm_display.sum(axis=0)    # 真实总数（列和）
+    total_pixels = cm.sum()
+
+    # 百分比混淆矩阵（按列归一化，每列真实类 = 100%）
+    cm_pct = np.zeros_like(cm_display, dtype=float)
+    for j in range(n):
+        if ref_totals[j] > 0:
+            cm_pct[:, j] = cm_display[:, j] / ref_totals[j] * 100
+    ref_pct_total = np.full(n, 100.0)
+
+    # 行百分比（每行预测类 = 100%）
+    cm_row_pct = np.zeros_like(cm_display, dtype=float)
+    for i in range(n):
+        if pred_totals[i] > 0:
+            cm_row_pct[i, :] = cm_display[i, :] / pred_totals[i] * 100
+    pred_pct_total = np.full(n, 100.0)
+
+    # Commission / Omission
+    commission_pct = []
+    omission_pct = []
+    commission_pix = []
+    omission_pix = []
+    for i in range(n):
+        # Commission: 预测为 i 但不是真实 i / 预测总数
+        comm_pix = pred_totals[i] - cm_display[i, i]
+        commission_pix.append(comm_pix)
+        commission_pct.append(comm_pix / pred_totals[i] * 100 if pred_totals[i] > 0 else 0)
+
+        # Omission: 真实为 i 但未被预测为 i / 真实总数
+        om_pix = ref_totals[i] - cm_display[i, i]
+        omission_pix.append(om_pix)
+        omission_pct.append(om_pix / ref_totals[i] * 100 if ref_totals[i] > 0 else 0)
+
+    # 生产者/用户精度的像素数
+    producer_pix = [cm_display[i, i] for i in range(n)]
+    user_pix = [cm_display[i, i] for i in range(n)]
+
+    # ====== 写入 TXT 报告 ======
     with open(output_txt, 'w', encoding='utf-8') as f:
-        f.write("=" * 90 + "\n")
-        f.write("ENVI 分类精度评价报告（基于名称匹配）\n")
-        f.write("=" * 90 + "\n\n")
+        sep = "=" * 100
+        f.write(sep + "\n")
+        f.write("ENVI 分类精度评价报告\n")
+        f.write(sep + "\n\n")
 
-        f.write("类别对应关系（名称匹配）:\n")
-        f.write(f"{'类别代码':<10} {'类别名称':<20} {'验证多边形数':<15}\n")
-        for code, name, count in class_info:
-            f.write(f"{code:<10} {name:<20} {count:<15}\n")
+        # --- 1. 像素数混淆矩阵 ---
+        f.write("Confusion Matrix (Pixels)\n")
+        f.write(f"{'':<20}" + "".join(f"{dn:<16}" for dn in display_names) + f"{'Total':<10}\n")
+        for i in range(n):
+            f.write(f"{display_names[i]:<20}")
+            for j in range(n):
+                f.write(f"{int(cm_display[i, j]):<16}")
+            f.write(f"{int(pred_totals[i]):<10}\n")
+        f.write(f"{'Total':<20}")
+        for j in range(n):
+            f.write(f"{int(ref_totals[j]):<16}")
+        f.write(f"{int(total_pixels):<10}\n")
 
-        f.write("\n混淆矩阵（行=真实，列=预测）:\n")
-        f.write(f"{'真实\\预测':<20}" + "".join(f"{name:<12}" for name in display_names) + "\n")
-        for i, name in enumerate(display_names):
-            f.write(f"{name:<20}" + "".join(f"{cm[i, j]:<12}" for j in range(len(class_names))) + "\n")
+        # --- 2. 百分比混淆矩阵（按列） ---
+        f.write("\nConfusion Matrix (Percent)\n")
+        f.write(f"{'':<20}" + "".join(f"{dn:<16}" for dn in display_names) + f"{'Total':<10}\n")
+        for i in range(n):
+            f.write(f"{display_names[i]:<20}")
+            for j in range(n):
+                f.write(f"{cm_pct[i, j]:<16.2f}")
+            f.write(f"{pred_pct_total[i]:<10.2f}\n")
+        f.write(f"{'Total':<20}")
+        for j in range(n):
+            f.write(f"{ref_pct_total[j]:<16.2f}")
+        f.write(f"{100.0:<10.2f}\n")
 
-        f.write(f"\n总体精度 (OA): {oa:.2f}%\n")
-        f.write(f"Kappa 系数: {kappa:.4f}\n\n")
+        # --- 3. Commission / Omission ---
+        f.write("\nClass    Commission(%)    Omission(%)    Commission(Pix)    Omission(Pix)\n")
+        f.write("-" * 75 + "\n")
+        for i in range(n):
+            f.write(f"{display_names[i]:<10} "
+                    f"{commission_pct[i]:<18.2f} "
+                    f"{omission_pct[i]:<14.2f} "
+                    f"{int(commission_pix[i]):<8}/{int(pred_totals[i]):<8}      "
+                    f"{int(omission_pix[i]):<5}/{int(ref_totals[i]):<5}\n")
 
-        f.write("各类别精度:\n")
-        f.write(f"{'类别名称':<20} {'代码':<6} {'生产者精度(%)':<16} {'用户精度(%)':<16}\n")
-        for i, name in enumerate(display_names):
-            f.write(f"{name:<20} {class_info[i][0]:<6} {producer[i]:<16.2f} {user[i]:<16.2f}\n")
-        f.write(f"{'平均':<20} {'—':<6} {np.mean(producer):<16.2f} {np.mean(user):<16.2f}\n")
+        # --- 4. 精度 ---
+        f.write("\nClass    Producer(%)    User(%)        Producer(Pix)    User(Pix)\n")
+        f.write("-" * 75 + "\n")
+        for i in range(n):
+            f.write(f"{display_names[i]:<10} "
+                    f"{producer[i]:<16.2f} "
+                    f"{user[i]:<14.2f} "
+                    f"{int(producer_pix[i]):<8}/{int(ref_totals[i]):<8}      "
+                    f"{int(user_pix[i]):<5}/{int(pred_totals[i]):<5}\n")
 
-    # CSV 混淆矩阵（使用带名称的标签）
+        # --- 5. 汇总 ---
+        f.write(f"\n{'Overall Accuracy:':<20} {oa:.2f}% ({int(np.diag(cm).sum())}/{int(total_pixels)})\n")
+        f.write(f"{'Kappa Coefficient:':<20} {kappa:.4f}\n")
+
+    # ====== CSV 混淆矩阵 ======
     cm_df = pd.DataFrame(cm, index=display_names, columns=display_names)
     cm_df.to_csv(output_csv, encoding='utf-8-sig')
 

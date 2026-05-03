@@ -306,7 +306,7 @@ def process_samples_optimized(sample_coords_path, experiment_data_path, output_d
     """优化处理样本（保持整数格式）"""
 
     base_name = os.path.splitext(os.path.basename(sample_coords_path))[0]
-    filtered_output = os.path.join(output_dir, f"{base_name}_筛选结果.csv")
+    filtered_output = os.path.join(output_dir, f"{base_name}.csv")
 
     try:
         # 1. 加载样本点
