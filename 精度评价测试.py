@@ -176,19 +176,29 @@ def load_shp_folder(shp_folder, class_name_to_code):
 # 4. 提取像元
 # ============================================================
 
-def extract_pixels(gdf, class_img, transform):
+def extract_pixels(gdf, class_img, transform, skip_nodata=True, shrink_pixels=0):
     """
     提取每个多边形内部所有像元的真实代码和预测代码。
+    参数:
+        skip_nodata: True=跳过0和1, False=保留未分类像元计入错误
+        shrink_pixels: 向内收缩像元数（1=排除边界, 与ENVI对齐）
     返回: (real_codes, pred_codes)
     """
     h, w = class_img.shape
     real_codes = []
     pred_codes = []
     class_img_int = class_img.astype(np.int32)
+    pixel_size = min(abs(transform[0]), abs(transform[4])) if transform else 1.0
 
     for idx, row in tqdm(gdf.iterrows(), total=len(gdf), desc="处理验证多边形"):
         geom = row.geometry
         true_code = int(row['true_code'])
+
+        # 向内收缩多边形，排除边界像元（对齐ENVI）
+        if shrink_pixels > 0:
+            geom = geom.buffer(-pixel_size * shrink_pixels)
+            if geom is None or geom.is_empty:
+                continue
 
         try:
             mask = features.geometry_mask([geom], out_shape=(h, w), transform=transform, invert=True)
@@ -197,8 +207,12 @@ def extract_pixels(gdf, class_img, transform):
             continue
 
         pixels = class_img_int[mask]
-        # 排除 NoData (=0 或 =1)，只保留有效分类值（用户定义类别从 2 开始）
-        valid_mask = (pixels != 0) & (pixels != 1)
+        if skip_nodata:
+            # 跳过 NoData (=0 或 =1)，只保留有效分类值（用户定义类别从 2 开始）
+            valid_mask = (pixels != 0) & (pixels != 1)
+        else:
+            # 保留所有像素，未分类(0)计入分类错误
+            valid_mask = pixels != 1  # 仅排除边框(1)，未分类(0)保留
         valid_pixels = pixels[valid_mask]
         if len(valid_pixels) == 0:
             continue
@@ -275,20 +289,20 @@ def export_report(cm, oa, kappa, producer, user, class_names, class_info, output
     n = len(class_names)
     display_names = [f"{name}({code})" for code, name, _ in class_info]
 
-    # 转置矩阵以匹配 ENVI 格式（行=预测, 列=真实）
-    # cm_display[i, j] = 预测为 i, 真实为 j
-    cm_display = cm.T
+    # sklearn cm[i,j] = 真实=i, 预测=j → 与 ENVI 格式一致（行=真实, 列=预测）
+    # 不需要转置
+    cm_display = cm
 
     # 各类别总计
-    pred_totals = cm_display.sum(axis=1)   # 预测总数（行和）
-    ref_totals = cm_display.sum(axis=0)    # 真实总数（列和）
+    ref_totals = cm_display.sum(axis=1)    # 真实总数（行和）
+    pred_totals = cm_display.sum(axis=0)   # 预测总数（列和）
     total_pixels = cm.sum()
 
-    # 百分比混淆矩阵（按列归一化，每列真实类 = 100%）
+    # 百分比混淆矩阵（按行归一化，每行真实类 = 100%）
     cm_pct = np.zeros_like(cm_display, dtype=float)
-    for j in range(n):
-        if ref_totals[j] > 0:
-            cm_pct[:, j] = cm_display[:, j] / ref_totals[j] * 100
+    for i in range(n):
+        if ref_totals[i] > 0:
+            cm_pct[i, :] = cm_display[i, :] / ref_totals[i] * 100
     ref_pct_total = np.full(n, 100.0)
 
     # 行百分比（每行预测类 = 100%）
@@ -314,10 +328,6 @@ def export_report(cm, oa, kappa, producer, user, class_names, class_info, output
         omission_pix.append(om_pix)
         omission_pct.append(om_pix / ref_totals[i] * 100 if ref_totals[i] > 0 else 0)
 
-    # 生产者/用户精度的像素数
-    producer_pix = [cm_display[i, i] for i in range(n)]
-    user_pix = [cm_display[i, i] for i in range(n)]
-
     # ====== 写入 TXT 报告 ======
     with open(output_txt, 'w', encoding='utf-8') as f:
         sep = "=" * 100
@@ -325,31 +335,32 @@ def export_report(cm, oa, kappa, producer, user, class_names, class_info, output
         f.write("ENVI 分类精度评价报告\n")
         f.write(sep + "\n\n")
 
-        # --- 1. 像素数混淆矩阵 ---
+        # --- 1. 像素数混淆矩阵（行=真实, 列=预测） ---
         f.write("Confusion Matrix (Pixels)\n")
-        f.write(f"{'':<20}" + "".join(f"{dn:<16}" for dn in display_names) + f"{'Total':<10}\n")
+        f.write("                " + "".join(f"{dn:<14}" for dn in display_names) + f"{'Total':<8}\n")
         for i in range(n):
-            f.write(f"{display_names[i]:<20}")
+            f.write(f"{display_names[i]:<16}")
             for j in range(n):
-                f.write(f"{int(cm_display[i, j]):<16}")
-            f.write(f"{int(pred_totals[i]):<10}\n")
-        f.write(f"{'Total':<20}")
+                f.write(f"{int(cm_display[i, j]):<14}")
+            f.write(f"{int(ref_totals[i]):<8}\n")
+        f.write(f"{'Total':<16}")
         for j in range(n):
-            f.write(f"{int(ref_totals[j]):<16}")
-        f.write(f"{int(total_pixels):<10}\n")
+            f.write(f"{int(pred_totals[j]):<14}")
+        f.write(f"{int(total_pixels):<8}\n")
 
-        # --- 2. 百分比混淆矩阵（按列） ---
+        # --- 2. 百分比混淆矩阵（每行真实类=100%） ---
         f.write("\nConfusion Matrix (Percent)\n")
-        f.write(f"{'':<20}" + "".join(f"{dn:<16}" for dn in display_names) + f"{'Total':<10}\n")
+        f.write("                " + "".join(f"{dn:<14}" for dn in display_names) + f"{'Total':<8}\n")
         for i in range(n):
-            f.write(f"{display_names[i]:<20}")
+            f.write(f"{display_names[i]:<16}")
             for j in range(n):
-                f.write(f"{cm_pct[i, j]:<16.2f}")
-            f.write(f"{pred_pct_total[i]:<10.2f}\n")
-        f.write(f"{'Total':<20}")
+                f.write(f"{cm_pct[i, j]:<14.2f}")
+            f.write(f"{100.0:<8.2f}\n")
+        f.write(f"{'Total':<16}")
         for j in range(n):
-            f.write(f"{ref_pct_total[j]:<16.2f}")
-        f.write(f"{100.0:<10.2f}\n")
+            total_pct = pred_totals[j] / total_pixels * 100 if total_pixels > 0 else 0
+            f.write(f"{total_pct:<14.2f}")
+        f.write(f"{100.0:<8.2f}\n")
 
         # --- 3. Commission / Omission ---
         f.write("\nClass    Commission(%)    Omission(%)    Commission(Pix)    Omission(Pix)\n")
@@ -368,8 +379,8 @@ def export_report(cm, oa, kappa, producer, user, class_names, class_info, output
             f.write(f"{display_names[i]:<10} "
                     f"{producer[i]:<16.2f} "
                     f"{user[i]:<14.2f} "
-                    f"{int(producer_pix[i]):<8}/{int(ref_totals[i]):<8}      "
-                    f"{int(user_pix[i]):<5}/{int(pred_totals[i]):<5}\n")
+                    f"{int(cm_display[i, i]):<8}/{int(ref_totals[i]):<8}      "
+                    f"{int(cm_display[i, i]):<5}/{int(pred_totals[i]):<5}\n")
 
         # --- 5. 汇总 ---
         f.write(f"\n{'Overall Accuracy:':<20} {oa:.2f}% ({int(np.diag(cm).sum())}/{int(total_pixels)})\n")
@@ -395,7 +406,7 @@ def main():
     print("  • 输入重分类结果文件（_reclass.dat），自动读取对应 .hdr 中的类别名称")
     print("  • 输入 SHP 文件夹，根据 SHP 文件名与类别名称自动匹配")
     print("  • 示例：SHP 文件 '耕地.shp' → 匹配 HDR 中类别名称 '耕地'")
-    print("  • 自动排除 Unclassified(0) 和 Border(1)")
+    print("  • 包含 Unclassified(0) 参与精度评价，结果与 ENVI 一致")
     print("=" * 80)
 
     # 交互输入
@@ -427,13 +438,18 @@ def main():
     # ---- 3. 读取 SHP 文件夹（按名称匹配） ----
     gdf, class_info = load_shp_folder(shp_folder, class_name_to_code)
 
+    # ---- 3b. 注入"未分类"类别代码0，匹配ENVI精度评价方式 ----
+    class_info.insert(0, (0, '未分类', 0))
+    print(f"   含'未分类(0)'共 {len(class_info)} 个类别参与精度评价")
+
     # ---- 4. 坐标系匹配 ----
     if crs and gdf.crs and gdf.crs != crs:
         print(f"\n🔄 坐标系转换: {gdf.crs} -> {crs}")
         gdf = gdf.to_crs(crs)
 
-    # ---- 5. 提取像素 ----
-    real_codes, pred_codes = extract_pixels(gdf, class_img, transform)
+    # ---- 5. 提取像元（保留未分类像元） ----
+    real_codes, pred_codes = extract_pixels(gdf, class_img, transform,
+                                            skip_nodata=False, shrink_pixels=0)
     if len(real_codes) == 0:
         print("❌ 无有效像素，请检查 SHP 是否与影像重叠")
         sys.exit(1)
