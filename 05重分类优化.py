@@ -29,8 +29,18 @@ def read_envi_header(hdr_path):
 
     print(f"📖 正在读取头文件: {hdr_path}")
 
-    with open(hdr_path, 'r', encoding='utf-8', errors='ignore') as f:
-        content = f.read()
+    # 尝试 GBK 优先（ENVI 中文版常用），失败则回退 UTF-8
+    content = None
+    for encoding in ['gbk', 'utf-8']:
+        try:
+            with open(hdr_path, 'r', encoding=encoding) as f:
+                content = f.read()
+            if content.strip():
+                break
+        except UnicodeDecodeError:
+            continue
+    if not content:
+        raise ValueError(f"无法读取 HDR 文件（尝试了 GBK 和 UTF-8）: {hdr_path}")
 
     # 提取关键参数
     samples = int(re.search(r'samples\s*=\s*(\d+)', content, re.IGNORECASE).group(1))
@@ -337,11 +347,21 @@ class names = {{Unclassified, Border, """
     # 写入HDR文件
     new_hdr_path = new_dat_path.replace('.dat', '.hdr')
     try:
-        # 使用 UTF-8 编码保存，编辑器可正常显示中文
-        # ENVI 5.6+ 中文版也支持读取 UTF-8 编码的 .hdr 文件
-        with open(new_hdr_path, 'w', encoding='utf-8') as f:
+        # 使用 GBK 编码保存，ENVI 中文版用 ANSI/GBK 读取 .hdr
+        # 如果编辑器打开乱码，请切换到 GBK/ANSI 编码查看
+        with open(new_hdr_path, 'w', encoding='gbk') as f:
             f.write(header_content)
-        print(f"✅ 重分类头文件已保存: {new_hdr_path} (编码: UTF-8)")
+        print(f"✅ 重分类头文件已保存: {new_hdr_path} (编码: GBK)")
+    except UnicodeEncodeError as e:
+        # 保底：如果GBK编码失败，用GBK的replace模式
+        print(f"⚠️  部分字符无法用GBK编码: {e}")
+        print("   使用GBK保底模式保存（无法编码的字符替换为?）")
+        try:
+            with open(new_hdr_path, 'w', encoding='gbk', errors='replace') as f:
+                f.write(header_content)
+        except Exception as e2:
+            print(f"❌ 保存HDR文件失败: {e2}")
+            return False
     except Exception as e:
         print(f"❌ 保存HDR文件失败: {e}")
         return False

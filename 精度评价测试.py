@@ -34,15 +34,16 @@ def read_class_names_from_hdr(hdr_path):
     if not os.path.exists(hdr_path):
         raise FileNotFoundError(f"HDR 文件不存在: {hdr_path}")
 
-    # 尝试 UTF-8，如果失败则尝试 GBK
+    # 尝试 GBK 优先，失败则尝试 UTF-8
+    # 注意：不能用 errors='ignore'，否则 GBK 中文会被 UTF-8 静默丢弃
     content = None
-    for encoding in ['utf-8', 'gbk', 'gb2312']:
+    for encoding in ['gbk', 'utf-8']:
         try:
-            with open(hdr_path, 'r', encoding=encoding, errors='ignore') as f:
+            with open(hdr_path, 'r', encoding=encoding) as f:
                 content = f.read()
             if content.strip():
                 break
-        except Exception:
+        except UnicodeDecodeError:
             continue
 
     if not content or not content.strip():
