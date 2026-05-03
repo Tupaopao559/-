@@ -337,20 +337,11 @@ class names = {{Unclassified, Border, """
     # 写入HDR文件
     new_hdr_path = new_dat_path.replace('.dat', '.hdr')
     try:
-        # ENVI 中文版使用系统ANSI编码(GBK)读取.hdr文件
-        with open(new_hdr_path, 'w', encoding='gbk') as f:
+        # 使用 UTF-8 编码保存，编辑器可正常显示中文
+        # ENVI 5.6+ 中文版也支持读取 UTF-8 编码的 .hdr 文件
+        with open(new_hdr_path, 'w', encoding='utf-8') as f:
             f.write(header_content)
-        print(f"✅ 重分类头文件已保存: {new_hdr_path} (编码: GBK)")
-    except UnicodeEncodeError as e:
-        # 保底：如果GBK编码失败，用GBK的replace模式 + Unicode字符用?替代
-        print(f"⚠️  部分字符无法用GBK编码: {e}")
-        print("   使用GBK保底模式保存（无法编码的字符替换为?）")
-        try:
-            with open(new_hdr_path, 'w', encoding='gbk', errors='replace') as f:
-                f.write(header_content)
-        except Exception as e2:
-            print(f"❌ 保存HDR文件失败: {e2}")
-            return False
+        print(f"✅ 重分类头文件已保存: {new_hdr_path} (编码: UTF-8)")
     except Exception as e:
         print(f"❌ 保存HDR文件失败: {e}")
         return False
