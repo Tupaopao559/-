@@ -173,52 +173,73 @@ def load_shp_folder(shp_folder, class_name_to_code):
 
 
 # ============================================================
-# 4. 提取像元
+# 4. 提取像元（点提取版，直接用 rowcol 定位）
 # ============================================================
+
+from rasterio.transform import rowcol
 
 def extract_pixels(gdf, class_img, transform, skip_nodata=True, shrink_pixels=0):
     """
-    提取每个多边形内部所有像元的真实代码和预测代码。
+    提取每个样本点对应像元的真实代码和预测代码。
+    验证SHP为点文件时，直接用 rowcol 将点坐标转为行列号。
+    验证SHP为多边形时，使用栅格化掩膜。
+
     参数:
         skip_nodata: True=跳过0和1, False=保留未分类像元计入错误
-        shrink_pixels: 向内收缩像元数（1=排除边界, 与ENVI对齐）
+        shrink_pixels: 无用（保留兼容）
     返回: (real_codes, pred_codes)
     """
     h, w = class_img.shape
     real_codes = []
     pred_codes = []
     class_img_int = class_img.astype(np.int32)
-    pixel_size = min(abs(transform[0]), abs(transform[4])) if transform else 1.0
 
-    for idx, row in tqdm(gdf.iterrows(), total=len(gdf), desc="处理验证多边形"):
-        geom = row.geometry
-        true_code = int(row['true_code'])
+    # 判断是点还是面
+    first_geom = gdf.iloc[0].geometry
+    is_point = 'Point' in first_geom.geom_type
 
-        # 向内收缩多边形，排除边界像元（对齐ENVI）
-        if shrink_pixels > 0:
-            geom = geom.buffer(-pixel_size * shrink_pixels)
-            if geom is None or geom.is_empty:
+    if is_point:
+        # ---- 点文件：直接用 rowcol 定位 ----
+        print("   检测到点文件，直接使用坐标定位...")
+        for idx, row in tqdm(gdf.iterrows(), total=len(gdf), desc="处理验证点"):
+            geom = row.geometry
+            true_code = int(row['true_code'])
+
+            # ENVI point ROIs are evaluated against the nearest pixel center.
+            r, c = rowcol(transform, geom.x, geom.y, op=np.round)
+            r, c = int(r), int(c)
+            if 0 <= r < h and 0 <= c < w:
+                val = int(class_img_int[r, c])
+                if val == 1:
+                    continue
+                if skip_nodata and val == 0:
+                    continue
+                real_codes.append(true_code)
+                pred_codes.append(val)
+    else:
+        # ---- 面文件：使用栅格化掩膜 ----
+        print("   检测到面文件，使用栅格化掩膜...")
+        for idx, row in tqdm(gdf.iterrows(), total=len(gdf), desc="处理验证多边形"):
+            geom = row.geometry
+            true_code = int(row['true_code'])
+
+            try:
+                mask = features.geometry_mask([geom], out_shape=(h, w), transform=transform, invert=True)
+            except Exception as e:
+                print(f"   警告: 多边形 {idx} 掩膜失败: {e}")
                 continue
 
-        try:
-            mask = features.geometry_mask([geom], out_shape=(h, w), transform=transform, invert=True)
-        except Exception as e:
-            print(f"   警告: 多边形 {idx} 掩膜失败: {e}")
-            continue
+            pixels = class_img_int[mask]
+            if skip_nodata:
+                valid_mask = (pixels != 0) & (pixels != 1)
+            else:
+                valid_mask = pixels != 1
+            valid_pixels = pixels[valid_mask]
+            if len(valid_pixels) == 0:
+                continue
 
-        pixels = class_img_int[mask]
-        if skip_nodata:
-            # 跳过 NoData (=0 或 =1)，只保留有效分类值（用户定义类别从 2 开始）
-            valid_mask = (pixels != 0) & (pixels != 1)
-        else:
-            # 保留所有像素，未分类(0)计入分类错误
-            valid_mask = pixels != 1  # 仅排除边框(1)，未分类(0)保留
-        valid_pixels = pixels[valid_mask]
-        if len(valid_pixels) == 0:
-            continue
-
-        real_codes.extend([true_code] * len(valid_pixels))
-        pred_codes.extend(valid_pixels.tolist())
+            real_codes.extend([true_code] * len(valid_pixels))
+            pred_codes.extend(valid_pixels.tolist())
 
     print(f"\n✅ 共提取 {len(real_codes)} 个有效像元")
     return real_codes, pred_codes
