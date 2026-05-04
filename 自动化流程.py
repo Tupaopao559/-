@@ -55,6 +55,7 @@ reclassify = mod_05.reclassify_with_geospatial_info
 read_hdr = mod_05.read_envi_header
 read_class_names = mod_eval.read_class_names_from_hdr
 load_shp = mod_eval.load_shp_folder
+# extract_pixels 内部对点 ROI 使用最近像元中心定位，和 ENVI 精度评价口径一致。
 extract_pixels = mod_eval.extract_pixels
 compute_metrics = mod_eval.compute_metrics
 export_report = mod_eval.export_report
