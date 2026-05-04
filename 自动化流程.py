@@ -3,13 +3,13 @@
 全自动遥感分类处理流程（优化版）
 ========================
 流程: 01填充合并 → 02样本测试 → 03匹配(循环) → 04ENVI转换 → 05重分类 → 精度评价
-循环条件: Kappa < 0.8 则提高阈值继续；达到0.8后继续搜索到Kappa不再上升
+循环条件: Kappa < 0.8 则提高阈值继续；达到0.8后继续搜索到Kappa不再上升；覆盖度100%时输出当前结果
 
 优化说明:
   1. 覆盖率监控 — 跟踪匹配(有值)像素占总像素比例
   2. 最优停止条件 — Kappa 达标后继续搜索，直到不再上升，输出最大Kappa结果
-  3. 自适应起始阈值 — 根据波段数量动态设定
-  4. 快速爬坡 — 覆盖率 < 10% 时大步长+20，之后小步长+5
+  3. 固定阈值策略 — 阈值从10开始，每轮增加5
+  4. 阈值限制在汉明距离有效范围内，避免超过序列长度
 """
 
 import os
@@ -80,6 +80,40 @@ def get_image_count(folder_path):
     return len(set(images))
 
 
+def infer_group_band_count(folder_path):
+    """
+    估计单组影像的波段/指数数量。
+    例如 20210101_B1 ... 20210101_NDWI 会被识别为同一组，而不是把所有日期文件数当波段数。
+    """
+    supported = ('.tif', '.tiff', '.img')
+    image_files = [
+        f for f in os.listdir(folder_path)
+        if f.lower().endswith(supported)
+        and not f.lower().endswith(('.aux', '.meta', '.enp'))
+    ]
+    if not image_files:
+        return 0
+
+    groups = {}
+    for filename in image_files:
+        stem = os.path.splitext(filename)[0]
+        match = re.match(r'^(\d{6,8})[_-](.+)$', stem)
+        if match:
+            group_key = match.group(1)
+        else:
+            group_key = 'all'
+        groups.setdefault(group_key, set()).add(stem)
+
+    group_sizes = [len(items) for items in groups.values() if items]
+    if not group_sizes:
+        return len(image_files)
+
+    size_counts = {}
+    for size in group_sizes:
+        size_counts[size] = size_counts.get(size, 0) + 1
+    return max(size_counts, key=lambda size: (size_counts[size], size))
+
+
 def run_matching(target_file, samples_folder, images_folder, output_file,
                  order_indices, replacements, threshold, num_rounds=1):
     """
@@ -92,9 +126,8 @@ def run_matching(target_file, samples_folder, images_folder, output_file,
     print(f"🔍 汉明距离匹配 — 阈值={threshold}")
     print(f"{'='*60}")
 
-    image_count = get_image_count(images_folder)
-    target_length = image_count
-    print(f"📊 影像数量 = {target_length}（作为序列标准长度）")
+    target_length = get_image_count(images_folder)
+    print(f"📊 序列长度 = {target_length}（参与合并的影像文件数）")
 
     sample_files = sorted([f for f in os.listdir(samples_folder) if f.lower().endswith('.csv')])
     ordered_files = [sample_files[i] for i in order_indices]
@@ -236,7 +269,7 @@ def run_matching(target_file, samples_folder, images_folder, output_file,
 def run_accuracy_evaluation(reclass_dat, eval_shp_folder, output_dir):
     """
     执行精度评价（含未分类惩罚：未分类像元计入分类错误）。
-    返回: (kappa, oa, total_valid_pixels, report_path)
+    返回: (kappa, oa, total_valid_pixels, report_path, classified_coverage)
     """
     print(f"\n{'='*60}")
     print(f"📊 执行精度评价（含未分类惩罚）")
@@ -279,7 +312,7 @@ def run_accuracy_evaluation(reclass_dat, eval_shp_folder, output_dir):
                                             skip_nodata=False, shrink_pixels=0)
     if len(real_codes) == 0:
         print("❌ 无有效像素")
-        return None, None, 0, None
+        return None, None, 0, None, coverage_total
 
     # 统计预测为0（未分类）的占比
     unclassified_pred = sum(1 for p in pred_codes if p == 0)
@@ -296,7 +329,7 @@ def run_accuracy_evaluation(reclass_dat, eval_shp_folder, output_dir):
     print(f"\n📊 OA = {oa:.2f}%, Kappa = {kappa:.4f}")
     print(f"   验证像素总数: {len(real_codes)}")
     print(f"   未分类占比: {unclassified_pred/len(real_codes)*100:.2f}%")
-    return kappa, oa, len(real_codes), txt_out
+    return kappa, oa, len(real_codes), txt_out, coverage_total
 
 
 # ============================================================
@@ -308,7 +341,7 @@ def main():
     print("=" * 80)
     print("流程: 01填充合并 → 02样本测试 → 03匹配(阈值循环)")
     print("      → 04ENVI转换 → 05重分类 → 精度评价")
-    print("停止条件: Kappa 达标后继续搜索，直到不再上升")
+    print("停止条件: Kappa 达标后继续搜索，直到不再上升；覆盖度100%时直接输出")
     print("=" * 80)
 
     # ---- 1. 用户输入 ----
@@ -376,10 +409,17 @@ def main():
     print(f"✅ 样本 CSV 文件: {sample_csvs}")
 
     # ---- 5. 循环参数 ----
-    # 自适应起始阈值：波段数较多时起始值也提高
-    band_count = get_image_count(img_folder)
-    initial_threshold = max(15, band_count // 5)  # 如 100波段 → 起始20; 200波段 → 起始40
+    # 固定阈值策略：不区分多光谱/高光谱，统一从10开始，每轮增加5。
+    # 阈值仍限制在有效汉明距离范围内，避免超过序列长度。
+    sequence_length = get_image_count(img_folder)
+    band_count = infer_group_band_count(img_folder)
+    if band_count == 0:
+        band_count = sequence_length
+    max_threshold = max(1, sequence_length)
+    initial_threshold = min(max_threshold, 10)
     threshold = initial_threshold
+    threshold_step = 5
+    fast_threshold_step = threshold_step
     match_count = 1
     max_iterations = 50
 
@@ -389,8 +429,10 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"📌 循环匹配 开始")
-    print(f"   波段数: {band_count}")
-    print(f"   自适应起始阈值: {threshold} (波段数÷5)")
+    print(f"   序列长度: {sequence_length}")
+    print(f"   单组波段/指数数: {band_count}")
+    print(f"   起始阈值: {threshold} (最大不超过序列长度 {max_threshold})")
+    print(f"   阈值步长: {threshold_step}")
     print(f"   目标Kappa: {min_kappa}")
     print(f"   匹配顺序: {sample_csvs}")
     print(f"   替换值: {replacements}")
@@ -400,6 +442,10 @@ def main():
                    "report": None, "matched_csv": None, "reclass_dat": None}
     reached_target = False
     kappa_epsilon = 1e-6
+    full_coverage_epsilon = 1e-6
+
+    def increase_threshold(current, step):
+        return min(max_threshold, current + step)
 
     for iteration in range(max_iterations):
         print(f"\n{'#'*70}")
@@ -424,7 +470,11 @@ def main():
 
         if not os.path.exists(matched_csv) or modified_count == 0:
             print(f"⚠️ 无匹配结果，快速提升阈值")
-            threshold += max(20, band_count // 10)
+            next_threshold = increase_threshold(threshold, fast_threshold_step)
+            if next_threshold == threshold:
+                print("⚠️ 阈值已达到汉明距离上限，无法继续提高")
+                break
+            threshold = next_threshold
             continue
 
         # ---- 5b. 04 ENVI转换 ----
@@ -432,6 +482,7 @@ def main():
         print("📌 步骤04: ENVI 转换")
         print(f"{'='*60}")
 
+        before_dat_files = set(f for f in os.listdir(dir_04) if f.endswith('.dat'))
         step04_main(
             input_csv=matched_csv,
             images_folder=img_folder,
@@ -443,9 +494,16 @@ def main():
         dat_files = [f for f in os.listdir(dir_04) if f.endswith('.dat')]
         if not dat_files:
             print("❌ 步骤04 未生成 .dat 文件")
-            threshold += max(10, band_count // 20)
+            next_threshold = increase_threshold(threshold, threshold_step)
+            if next_threshold == threshold:
+                print("⚠️ 阈值已达到汉明距离上限，无法继续提高")
+                break
+            threshold = next_threshold
             continue
-        envi_dat = os.path.join(dir_04, dat_files[0])
+        new_dat_files = [f for f in dat_files if f not in before_dat_files]
+        selected_dat_files = new_dat_files if new_dat_files else dat_files
+        selected_dat_files.sort(key=lambda f: os.path.getmtime(os.path.join(dir_04, f)), reverse=True)
+        envi_dat = os.path.join(dir_04, selected_dat_files[0])
         print(f"✅ 生成 ENVI 文件: {envi_dat}")
 
         # ---- 5c. 05 重分类 ----
@@ -457,7 +515,11 @@ def main():
         success = reclassify(envi_dat, class_value_groups, class_names_match)
         if not success:
             print("❌ 步骤05 重分类失败")
-            threshold += max(10, band_count // 20)
+            next_threshold = increase_threshold(threshold, threshold_step)
+            if next_threshold == threshold:
+                print("⚠️ 阈值已达到汉明距离上限，无法继续提高")
+                break
+            threshold = next_threshold
             continue
 
         base_reclass = os.path.splitext(envi_dat)[0]
@@ -475,10 +537,14 @@ def main():
         result = run_accuracy_evaluation(reclass_dat, eval_shp_folder, dir_eval)
         if result[0] is None:
             print("⚠️ 精度评价失败")
-            threshold += max(10, band_count // 20)
+            next_threshold = increase_threshold(threshold, threshold_step)
+            if next_threshold == threshold:
+                print("⚠️ 阈值已达到汉明距离上限，无法继续提高")
+                break
+            threshold = next_threshold
             continue
 
-        kappa, oa, eval_pixels, report_path = result
+        kappa, oa, eval_pixels, report_path, class_coverage = result
 
         # ---- 5e. 综合评判 ----
         print(f"\n{'='*70}")
@@ -487,11 +553,15 @@ def main():
         print(f"   验证像素: {eval_pixels}")
         print(f"   Kappa: {kappa:.4f}")
         print(f"   OA: {oa:.2f}%")
-        print(f"   分类图有效覆盖率: 见上方")
+        print(f"   分类图有效覆盖率: {class_coverage:.2f}%")
         print(f"{'='*70}")
 
         # 记录当前最佳结果（仅按Kappa排序）
         improved = kappa > best_result["kappa"] + kappa_epsilon
+        full_coverage = (
+            match_coverage >= 100.0 - full_coverage_epsilon
+            or class_coverage >= 100.0 - full_coverage_epsilon
+        )
         if improved:
             best_result = {
                 "kappa": kappa,
@@ -500,21 +570,50 @@ def main():
                 "matched_csv": matched_csv,
                 "reclass_dat": reclass_dat,
                 "oa": oa,
-                "eval_pixels": eval_pixels
+                "eval_pixels": eval_pixels,
+                "match_coverage": match_coverage,
+                "class_coverage": class_coverage
             }
+
+        if full_coverage and kappa < min_kappa:
+            best_result = {
+                "kappa": kappa,
+                "threshold": threshold,
+                "report": report_path,
+                "matched_csv": matched_csv,
+                "reclass_dat": reclass_dat,
+                "oa": oa,
+                "eval_pixels": eval_pixels,
+                "match_coverage": match_coverage,
+                "class_coverage": class_coverage
+            }
+            print(f"\n✅ 覆盖度已达到100%，即使 Kappa={kappa:.4f} < {min_kappa} 也输出当前结果")
+            break
 
         # 停止条件：达标后继续试探，直到Kappa不再上升
         if not reached_target:
             if kappa >= min_kappa:
                 reached_target = True
                 print(f"\n🎉 Kappa已达标: {kappa:.4f} ≥ {min_kappa}，继续提高阈值寻找最大值")
-                threshold += 5
+                next_threshold = increase_threshold(threshold, threshold_step)
+                if next_threshold == threshold:
+                    print("✅ 阈值已达到汉明距离上限，输出当前最佳结果")
+                    break
+                threshold = next_threshold
             else:
-                print(f"   Kappa={kappa:.4f} < {min_kappa}，提高阈值 +5")
-                threshold += 5
+                next_threshold = increase_threshold(threshold, threshold_step)
+                if next_threshold == threshold:
+                    print(f"✅ 阈值已达到汉明距离上限，输出当前最佳结果")
+                    break
+                print(f"   Kappa={kappa:.4f} < {min_kappa}，提高阈值 +{next_threshold - threshold}")
+                threshold = next_threshold
         elif improved:
-            print(f"   Kappa继续上升到 {kappa:.4f}，继续提高阈值 +5")
-            threshold += 5
+            next_threshold = increase_threshold(threshold, threshold_step)
+            if next_threshold == threshold:
+                print("✅ 阈值已达到汉明距离上限，输出当前最佳结果")
+                break
+            print(f"   Kappa继续上升到 {kappa:.4f}，继续提高阈值 +{next_threshold - threshold}")
+            threshold = next_threshold
         else:
             print(f"\n✅ Kappa未继续上升，停止搜索")
             print(f"   当前Kappa: {kappa:.4f}")
@@ -542,6 +641,8 @@ def main():
         print(f"   Kappa: {best_result['kappa']:.4f}")
         print(f"   OA: {best_result['oa']:.2f}%")
         print(f"   验证像素: {best_result['eval_pixels']}")
+        print(f"   匹配覆盖率: {best_result.get('match_coverage', 0):.2f}%")
+        print(f"   分类图覆盖率: {best_result.get('class_coverage', 0):.2f}%")
         print(f"   报告: {best_result['report']}")
 
     print(f"\n📂 各步骤目录:")
