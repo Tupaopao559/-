@@ -3,11 +3,11 @@
 全自动遥感分类处理流程（优化版）
 ========================
 流程: 01填充合并 → 02样本测试 → 03匹配(循环) → 04ENVI转换 → 05重分类 → 精度评价
-循环条件: Kappa < 0.8 或 覆盖率 < 50% 则提高阈值继续
+循环条件: Kappa < 0.8 则提高阈值继续；达到0.8后继续搜索到Kappa不再上升
 
 优化说明:
   1. 覆盖率监控 — 跟踪匹配(有值)像素占总像素比例
-  2. 双重停止条件 — Kappa ≥ 0.8 且 覆盖率 ≥ 50%
+  2. 最优停止条件 — Kappa 达标后继续搜索，直到不再上升，输出最大Kappa结果
   3. 自适应起始阈值 — 根据波段数量动态设定
   4. 快速爬坡 — 覆盖率 < 10% 时大步长+20，之后小步长+5
 """
@@ -308,7 +308,7 @@ def main():
     print("=" * 80)
     print("流程: 01填充合并 → 02样本测试 → 03匹配(阈值循环)")
     print("      → 04ENVI转换 → 05重分类 → 精度评价")
-    print("停止条件: Kappa ≥ 0.8")
+    print("停止条件: Kappa 达标后继续搜索，直到不再上升")
     print("=" * 80)
 
     # ---- 1. 用户输入 ----
@@ -396,8 +396,10 @@ def main():
     print(f"   替换值: {replacements}")
     print(f"{'='*60}")
 
-    best_result = {"kappa": 0, "threshold": 0,
+    best_result = {"kappa": float("-inf"), "threshold": 0,
                    "report": None, "matched_csv": None, "reclass_dat": None}
+    reached_target = False
+    kappa_epsilon = 1e-6
 
     for iteration in range(max_iterations):
         print(f"\n{'#'*70}")
@@ -489,7 +491,8 @@ def main():
         print(f"{'='*70}")
 
         # 记录当前最佳结果（仅按Kappa排序）
-        if kappa > best_result["kappa"]:
+        improved = kappa > best_result["kappa"] + kappa_epsilon
+        if improved:
             best_result = {
                 "kappa": kappa,
                 "threshold": threshold,
@@ -500,18 +503,32 @@ def main():
                 "eval_pixels": eval_pixels
             }
 
-        # 停止条件：仅判断Kappa
-        if kappa >= min_kappa:
-            print(f"\n🎉🎉🎉 达标! Kappa={kappa:.4f} ≥ {min_kappa}")
-            break
-        else:
-            print(f"   Kappa={kappa:.4f} < {min_kappa}，提高阈值 +5")
+        # 停止条件：达标后继续试探，直到Kappa不再上升
+        if not reached_target:
+            if kappa >= min_kappa:
+                reached_target = True
+                print(f"\n🎉 Kappa已达标: {kappa:.4f} ≥ {min_kappa}，继续提高阈值寻找最大值")
+                threshold += 5
+            else:
+                print(f"   Kappa={kappa:.4f} < {min_kappa}，提高阈值 +5")
+                threshold += 5
+        elif improved:
+            print(f"   Kappa继续上升到 {kappa:.4f}，继续提高阈值 +5")
             threshold += 5
+        else:
+            print(f"\n✅ Kappa未继续上升，停止搜索")
+            print(f"   当前Kappa: {kappa:.4f}")
+            print(f"   最佳Kappa: {best_result['kappa']:.4f} (阈值={best_result['threshold']})")
+            break
 
     else:
-        print(f"\n❌ 经过 {max_iterations} 次循环未满足终止条件")
-        print(f"   当前最佳结果: 阈值={best_result['threshold']}, "
-              f"Kappa={best_result['kappa']:.4f}")
+        if reached_target:
+            print(f"\n⚠️ 已达到最大循环次数，输出当前最佳结果")
+        else:
+            print(f"\n❌ 经过 {max_iterations} 次循环仍未达到目标Kappa")
+        if best_result["report"]:
+            print(f"   当前最佳结果: 阈值={best_result['threshold']}, "
+                  f"Kappa={best_result['kappa']:.4f}")
 
     # ---- 6. 最终总结 ----
     print(f"\n{'='*80}")
