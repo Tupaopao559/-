@@ -10,6 +10,14 @@ import tempfile
 import shutil
 
 
+def lazy_import_rasterio():
+    try:
+        import rasterio
+        return rasterio
+    except ImportError:
+        return None
+
+
 def delete_specific_bands(input_folder, delete_ranges=None):
     """删除指定波段范围的文件"""
     if delete_ranges is None:
@@ -57,24 +65,38 @@ def process_single_image(image_path, output_dir):
         filename = os.path.splitext(os.path.basename(image_path))[0]
         output_path = os.path.join(output_dir, f"{filename}.csv")
 
-        # 尝试导入PIL库
-        try:
-            from PIL import Image
-        except ImportError:
-            print("错误: 请先安装PIL库 (pip install Pillow)")
-            return False
-
-        with Image.open(image_path) as img:
-            if hasattr(img, 'n_frames') and img.n_frames > 1:
-                img.seek(0)
-            data = np.array(img)
-
-        # 处理多通道图像（如RGB）
-        if data.ndim == 3:
-            if data.shape[2] >= 1:
-                data = data[:, :, 0]  # 取第一个波段
-            else:
+        rasterio = lazy_import_rasterio()
+        if rasterio is not None:
+            with rasterio.open(image_path) as src:
+                band_count = src.count
+                if band_count > 1:
+                    # ⭐ 修复：多波段影像——每个波段独立输出为一个 CSV
+                    print(f"   检测到多波段文件 ({band_count} 波段): {os.path.basename(image_path)}")
+                    for b in range(1, band_count + 1):
+                        data_b = src.read(b)
+                        band_output = os.path.join(output_dir, f"{filename}_B{b}.csv")
+                        pd.DataFrame(data_b).to_csv(band_output, index=False, header=False)
+                    print(f"   ✅ 已分解 {band_count} 个波段为独立 CSV")
+                    return True
+                data = src.read(1)
+        else:
+            try:
+                from PIL import Image
+            except ImportError:
+                print("错误: 请先安装 rasterio 或 PIL")
                 return False
+
+            with Image.open(image_path) as img:
+                if hasattr(img, 'n_frames') and img.n_frames > 1:
+                    img.seek(0)
+                data = np.array(img)
+
+            # 处理多通道图像（如RGB）
+            if data.ndim == 3:
+                if data.shape[2] >= 1:
+                    data = data[:, :, 0]  # 取第一个波段
+                else:
+                    return False
 
         df = pd.DataFrame(data)
         df.to_csv(output_path, index=False, header=False)
@@ -90,6 +112,7 @@ def batch_process_images(input_dir, output_dir):
     image_files = []
     for ext in supported_extensions:
         image_files.extend(glob(os.path.join(input_dir, f'*{ext}')))
+        image_files.extend(glob(os.path.join(input_dir, f'*{ext.upper()}')))
     image_files = sorted(set(image_files))
 
     if not image_files:
@@ -150,8 +173,8 @@ def process_large_csv_files_with_progress(input_dir, output_dir, num_classes=5):
                 raise ValueError("数据不足")
 
             data_values = []
-            for i in range(1, len(rows)):
-                for j in range(1, len(rows[i])):
+            for i in range(len(rows)):
+                for j in range(len(rows[i])):
                     cell = rows[i][j]
                     try:
                         val = float(cell)
@@ -187,10 +210,7 @@ def process_large_csv_files_with_progress(input_dir, output_dir, num_classes=5):
             for i, row in enumerate(rows):
                 new_row = []
                 for j, cell in enumerate(row):
-                    if i == 0 or j == 0:
-                        new_row.append(cell)
-                    else:
-                        new_row.append(classify(cell, thresholds, num_classes))
+                    new_row.append(classify(cell, thresholds, num_classes))
                 new_rows.append(new_row)
 
             with open(output_path, 'w', encoding='utf-8', newline='') as f:
@@ -224,8 +244,6 @@ def merge_csv_cells_by_position(input_dir, output_dir, filename, adjust_sizes=Tr
     merged_data = None
     target_rows = 0
     target_cols = 0
-    target_headers = None
-    target_first_col = None
 
     file_paths = [os.path.join(input_dir, f) for f in csv_files]
 
@@ -254,9 +272,6 @@ def merge_csv_cells_by_position(input_dir, output_dir, filename, adjust_sizes=Tr
                     target_cols = current_cols
                     # 初始化合并容器
                     merged_data = [[[] for _ in range(target_cols)] for _ in range(target_rows)]
-                    # 记录首行首列
-                    target_headers = rows[0][:target_cols] if current_rows > 0 else []
-                    target_first_col = [row[0] if len(row) > 0 else '' for row in rows[:target_rows]]
                     tqdm.write(f"📏 设定基准尺寸: {target_rows} x {target_cols}")
 
                 # 如果需要调整尺寸，则调整当前文件以匹配基准
@@ -297,12 +312,6 @@ def merge_csv_cells_by_position(input_dir, output_dir, filename, adjust_sizes=Tr
                     for j in range(min(target_cols, len(rows[i]))):
                         cell = rows[i][j] if j < len(rows[i]) else ''
 
-                        # 首行首列：只保留第一个文件的值
-                        if i == 0 or j == 0:
-                            if idx == 0 or not merged_data[i][j]:  # 如果是第一个文件，或者该位置还是空的
-                                merged_data[i][j] = cell
-                            continue
-
                         try:
                             # 转为浮点再格式化，去除多余0
                             val = f"{float(cell):.6g}" if cell != '' else ''
@@ -328,15 +337,11 @@ def merge_csv_cells_by_position(input_dir, output_dir, filename, adjust_sizes=Tr
         new_row = []
         for j in range(target_cols):
             cell = merged_data[i][j]
-            if i == 0 or j == 0:
-                # 确保首行列是字符串
-                new_row.append(str(cell) if cell is not None else '')
+            # 合并列表中的数值
+            if isinstance(cell, list):
+                new_row.append(" ".join(cell))
             else:
-                # 合并列表中的数值
-                if isinstance(cell, list):
-                    new_row.append(" ".join(cell))
-                else:
-                    new_row.append(str(cell))
+                new_row.append(str(cell))
         final_rows.append(new_row)
 
     # 写入输出文件
@@ -395,7 +400,9 @@ def get_input_output_paths():
     return input_img_dir, output_dir
 
 
-def check_pil_installation():
+def check_image_reader_installation():
+    if lazy_import_rasterio() is not None:
+        return True
     try:
         from PIL import Image
         return True
@@ -428,10 +435,10 @@ def cleanup_temp_dir(temp_dir):
 
 
 def main(input_img_dir, output_dir, filename, delete_ranges=None, num_classes=5, adjust_sizes=True):
-    # 检查PIL是否已安装
-    if not check_pil_installation():
-        print("警告: 未检测到PIL库，将无法处理影像文件")
-        print("请运行: pip install Pillow")
+    # 检查影像读取库是否已安装
+    if not check_image_reader_installation():
+        print("警告: 未检测到 rasterio/PIL，将无法处理影像文件")
+        print("请运行: pip install rasterio 或 pip install Pillow")
         print("如果只有CSV文件，可以继续处理")
 
         # 检查是否有CSV文件
@@ -459,6 +466,7 @@ def main(input_img_dir, output_dir, filename, delete_ranges=None, num_classes=5,
         supported_extensions = ['.tif', '.tiff', '.img']
         for ext in supported_extensions:
             image_files.extend(glob(os.path.join(input_img_dir, f'*{ext}')))
+            image_files.extend(glob(os.path.join(input_img_dir, f'*{ext.upper()}')))
 
         if image_files:
             # 如果有影像文件，进行影像处理流程
@@ -509,10 +517,10 @@ def main(input_img_dir, output_dir, filename, delete_ranges=None, num_classes=5,
 
 
 if __name__ == "__main__":
-    # 检查PIL安装
-    if not check_pil_installation():
-        print("警告: 未检测到PIL库，将无法处理影像文件")
-        print("请运行: pip install Pillow")
+    # 检查影像读取库
+    if not check_image_reader_installation():
+        print("警告: 未检测到 rasterio/PIL，将无法处理影像文件")
+        print("请运行: pip install rasterio 或 pip install Pillow")
         print("如果只有CSV文件，可以继续处理")
 
     # 获取用户输入的绝对路径

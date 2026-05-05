@@ -34,13 +34,13 @@ def detect_encoding(file_path):
 
 def count_tif_files(tif_folder):
     """统计TIF文件数量"""
-    tif_files = [f for f in os.listdir(tif_folder) if f.lower().endswith(('.tif', '.tiff'))]
+    tif_files = sorted(f for f in os.listdir(tif_folder) if f.lower().endswith(('.tif', '.tiff')))
     return len(tif_files)
 
 
 def find_first_valid_tif(tif_folder):
     """查找第一个有效的TIF文件"""
-    tif_files = [f for f in os.listdir(tif_folder) if f.lower().endswith(('.tif', '.tiff'))]
+    tif_files = sorted(f for f in os.listdir(tif_folder) if f.lower().endswith(('.tif', '.tiff')))
     if not tif_files:
         return None
     return os.path.join(tif_folder, tif_files[0])

@@ -155,12 +155,25 @@ def reclassify_with_geospatial_info(dat_path, class_value_groups, class_names):
             print(f"⚠️  警告：数据大小不匹配!")
             print(f"   期望: {total_elements_with_bands} 元素 ({bands} 波段)")
             print(f"   实际: {data.size} 元素")
-            # 尝试自动调整
             if data.size == total_elements:
                 print("   自动调整为单波段数据")
                 bands = 1
             else:
-                return False
+                # ⭐ 修复：报告尺寸不匹配但试图从 HDR 推断正确尺寸
+                # 通过 data.size 反推实际可能的总元素数（取最接近的整除数）
+                actual_total = int(np.sqrt(data.size)) ** 2  # 尝试取平方
+                for candidate_h in range(int(np.sqrt(data.size)), lines * 2):
+                    if data.size % candidate_h == 0:
+                        candidate_w = data.size // candidate_h
+                        if abs(candidate_h * candidate_w - data.size) < 0.001:
+                            print(f"   自动检测到实际尺寸: {candidate_h} × {candidate_w}")
+                            lines = candidate_h
+                            samples = candidate_w
+                            total_elements = lines * samples
+                            break
+                else:
+                    print(f"❌ 无法自动匹配数据尺寸，请检查 HDR 与实际数据是否一致")
+                    return False
 
         data = data.reshape((bands, lines, samples))
         if bands > 1:
@@ -169,13 +182,27 @@ def reclassify_with_geospatial_info(dat_path, class_value_groups, class_names):
     else:
         if data.size != total_elements:
             print(f"⚠️  警告：数据大小不匹配!")
-            print(f"   期望: {total_elements} 元素")
+            print(f"   期望: {total_elements} 元素 ({samples}×{lines} = {total_elements})")
             print(f"   实际: {data.size} 元素")
-            # 尝试截断或填充
+            # ⭐ 修复：尝试自动检测正确尺寸，而非直接截断
+            # 算出行数和列数最接近的整数因子
             if data.size > total_elements:
-                data = data[:total_elements]
-                print(f"   截断到 {total_elements} 元素")
+                # 可能 HDR 里 lines/samples 被写错了，尝试用 data.size 反推
+                for candidate_h in range(lines, int(np.sqrt(data.size)) * 2):
+                    if data.size % candidate_h == 0:
+                        candidate_w = data.size // candidate_h
+                        print(f"   自动检测到实际尺寸: {candidate_h} × {candidate_w} (原 HDR: {lines}×{samples})")
+                        lines = candidate_h
+                        samples = candidate_w
+                        total_elements = lines * samples
+                        break
+                else:
+                    print(f"❌ 无法自动匹配数据尺寸")
+                    print(f"   可能原因：ENVI 文件包含额外的文件头或元数据")
+                    print(f"   建议：用 rasterio 而非 np.fromfile 读取该文件")
+                    return False
             else:
+                print(f"❌ 数据比预期少，无法处理")
                 return False
 
         data = data.reshape((lines, samples))

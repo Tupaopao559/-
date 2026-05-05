@@ -14,7 +14,7 @@ def calculate_hamming_distance(seq1, seq2):
 
 def get_image_count_from_folder(folder_path):
     """从文件夹中统计影像图数量"""
-    supported_extensions = ['.tif', '.tiff', '.img', '.jpg', '.jpeg', '.png', '.bmp', '.gif']
+    supported_extensions = ['.tif', '.tiff', '.img']
     image_files = []
 
     for ext in supported_extensions:
@@ -22,7 +22,7 @@ def get_image_count_from_folder(folder_path):
         image_files.extend(glob(os.path.join(folder_path, f'*{ext.upper()}')))
 
     # 去重
-    image_files = list(set(image_files))
+    image_files = sorted(set(image_files))
     return len(image_files), image_files
 
 
@@ -39,7 +39,7 @@ def multi_standard_hamming_match():
     image_count, image_files = get_image_count_from_folder(images_folder)
     if image_count == 0:
         print("❌ 在影像图文件夹中未找到任何支持的影像文件")
-        print("支持的格式: .tif, .tiff, .img, .jpg, .jpeg, .png, .bmp, .gif")
+        print("支持的格式: .tif, .tiff, .img")
         return False
 
     print(f"\n📊 检测到 {image_count} 个影像文件，将使用 {image_count} 作为序列标准长度")
@@ -264,6 +264,7 @@ def multi_standard_hamming_match():
     total_cells = sum(len(row) for row in target_rows if row)
     total_modified = 0
     total_empty_assigned = 0  # 统计被赋予-1的空单元格数量
+    total_ambiguous = 0
 
     for round_num in range(num_rounds):
         print(f"\n🔄 开始第 {round_num + 1} 轮匹配...")
@@ -272,6 +273,7 @@ def multi_standard_hamming_match():
 
         modified_in_round = 0
         empty_assigned_in_round = 0
+        ambiguous_in_round = 0
 
         with tqdm(total=total_cells, desc=f"第{round_num + 1}轮匹配进度", unit="单元格") as pbar:
             for row_idx, row in enumerate(modified_data):
@@ -302,6 +304,7 @@ def multi_standard_hamming_match():
 
                         best_match = None
                         best_distance = float('inf')
+                        best_replacements = set()
 
                         for sample_idx, ref_sequences in enumerate(all_reference_sequences):
                             for ref in ref_sequences:
@@ -309,6 +312,15 @@ def multi_standard_hamming_match():
                                 if dist < best_distance:
                                     best_distance = dist
                                     best_match = current_replacements[sample_idx]
+                                    best_replacements = {current_replacements[sample_idx]}
+                                elif dist == best_distance:
+                                    best_replacements.add(current_replacements[sample_idx])
+
+                        if len(best_replacements) > 1:
+                            ambiguous_in_round += 1
+                            total_ambiguous += 1
+                            pbar.update(1)
+                            continue
 
                         if best_match is not None and best_distance <= current_threshold:
                             modified_data[row_idx][col_idx] = best_match
@@ -322,6 +334,7 @@ def multi_standard_hamming_match():
 
         print(
             f"✅ 第 {round_num + 1} 轮匹配完成，修改了 {modified_in_round} 个单元格，空单元格赋值-1: {empty_assigned_in_round} 个")
+        print(f"   多类别同距离未分类: {ambiguous_in_round}")
 
         # === 保存本轮中间结果 ===
         round_output_file = os.path.join(output_dir, f"out{round_num + 1}_{current_threshold}.csv")
@@ -364,6 +377,7 @@ def multi_standard_hamming_match():
     print(f"- 总参考序列: {total_sequences}")
     print(f"- 匹配成功单元格: {total_modified}")
     print(f"- 空单元格赋值-1: {total_empty_assigned}")
+    print(f"- 多类别同距离未分类: {total_ambiguous}")
     print("-1值含义:")
     print("  - 单元格内容为空（仅空白字符）")
     print("注意: 长度不匹配或转换失败的单元格保持原始值不变")

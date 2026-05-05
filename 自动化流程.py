@@ -71,8 +71,33 @@ def calculate_hamming_distance(seq1, seq2):
     return sum(a != b for a, b in zip(seq1, seq2))
 
 
+def detect_striped_classification(dat_path, warn_ratio=0.35):
+    """
+    检测明显横向条带：逐行有效分类覆盖率差异过大时返回 True。
+    只作为自动化流程中的坏图拦截，不改变分类算法本身。
+    """
+    try:
+        import rasterio
+        with rasterio.open(dat_path) as src:
+            data = src.read(1)
+    except Exception as e:
+        print(f"⚠️ 条带检测跳过，无法读取分类图: {e}")
+        return False
+
+    valid = data >= 2
+    row_coverage = valid.mean(axis=1)
+    high_rows = np.sum(row_coverage > 0.20)
+    low_rows = np.sum(row_coverage < 0.02)
+    striped_score = min(high_rows, low_rows) / len(row_coverage) if len(row_coverage) else 0
+    if striped_score >= warn_ratio:
+        print("⚠️ 检测到明显横向条带风险")
+        print(f"   高覆盖行: {high_rows}, 低覆盖行: {low_rows}, 条带评分: {striped_score:.2f}")
+        return True
+    return False
+
+
 def get_image_count(folder_path):
-    supported = ['.tif', '.tiff', '.img', '.jpg', '.jpeg', '.png', '.bmp', '.gif']
+    supported = ['.tif', '.tiff', '.img']
     images = []
     for ext in supported:
         images.extend(glob(os.path.join(folder_path, f'*{ext}')))
@@ -215,6 +240,7 @@ def run_matching(target_file, samples_folder, images_folder, output_file,
 
     modified_count = 0
     short_loop_count = 0  # 有数据但长度不符合的
+    ambiguous_count = 0
 
     for row_idx, row in enumerate(tqdm(modified_data, desc="匹配进度", unit="行")):
         for col_idx, cell in enumerate(row):
@@ -234,12 +260,20 @@ def run_matching(target_file, samples_folder, images_folder, output_file,
 
             best_match = None
             best_dist = float('inf')
+            best_replacements = set()
             for s_idx, refs in enumerate(all_reference_sequences):
                 for ref in refs:
                     dist = calculate_hamming_distance(current, ref)
                     if dist < best_dist:
                         best_dist = dist
                         best_match = replacements[s_idx]
+                        best_replacements = {replacements[s_idx]}
+                    elif dist == best_dist:
+                        best_replacements.add(replacements[s_idx])
+
+            if len(best_replacements) > 1:
+                ambiguous_count += 1
+                continue
 
             if best_match is not None and best_dist <= threshold:
                 modified_data[row_idx][col_idx] = best_match
@@ -258,6 +292,7 @@ def run_matching(target_file, samples_folder, images_folder, output_file,
     print(f"   有效数据像元: {total_data_cells}")
     print(f"   成功匹配: {modified_count} ({coverage:.2f}%)")
     print(f"   未匹配(将变为0/NoData): {total_data_cells - modified_count} ({100 - coverage:.2f}%)")
+    print(f"   多类别同距离未分类: {ambiguous_count}")
     print(f"   剩余为空/表头等: {short_loop_count}")
 
     return modified_count, total_data_cells
@@ -532,6 +567,15 @@ def main():
             shutil.copy2(reclass_dat, os.path.join(dir_05, os.path.basename(reclass_dat)))
         if os.path.exists(reclass_hdr):
             shutil.copy2(reclass_hdr, os.path.join(dir_05, os.path.basename(reclass_hdr)))
+
+        if detect_striped_classification(reclass_dat):
+            print("⚠️ 当前阈值结果疑似条带错位，跳过本轮")
+            next_threshold = increase_threshold(threshold, threshold_step)
+            if next_threshold == threshold:
+                print("⚠️ 阈值已达到汉明距离上限，无法继续提高")
+                break
+            threshold = next_threshold
+            continue
 
         # ---- 5d. 精度评价 ----
         result = run_accuracy_evaluation(reclass_dat, eval_shp_folder, dir_eval)

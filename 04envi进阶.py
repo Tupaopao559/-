@@ -10,7 +10,7 @@ import sys
 
 def get_image_count_from_folder(folder_path):
     """从文件夹中统计影像图数量"""
-    supported_extensions = ['.tif', '.tiff', '.img', '.jpg', '.jpeg', '.png', '.bmp', '.gif']
+    supported_extensions = ['.tif', '.tiff', '.img']
     image_files = []
 
     for ext in supported_extensions:
@@ -18,7 +18,7 @@ def get_image_count_from_folder(folder_path):
         image_files.extend(glob(os.path.join(folder_path, f'*{ext.upper()}')))
 
     # 去重
-    image_files = list(set(image_files))
+    image_files = sorted(set(image_files))
     return len(image_files), image_files
 
 
@@ -53,8 +53,11 @@ def process_csv_pandas(input_file, output_file, target_length, max_sequence_leng
             cell_parts = cell.strip().split()
             # 检查是否为有效的数字序列
             try:
-                # 过滤掉空字符串，只保留有效的数字
-                valid_parts = [part for part in cell_parts if part.strip().isdigit()]
+                valid_parts = []
+                for part in cell_parts:
+                    if part.strip():
+                        float(part)
+                        valid_parts.append(part)
                 # 检查序列长度是否等于目标长度或大于最大序列长度
                 if len(valid_parts) == target_length or (
                         max_sequence_length and len(valid_parts) > max_sequence_length):
@@ -67,14 +70,6 @@ def process_csv_pandas(input_file, output_file, target_length, max_sequence_leng
 
         # 批量应用处理函数到所有单元格
         print("正在处理数据...")
-
-        # 处理首行，将可能是行号的单元格转换为-1
-        if not df.empty:
-            # 遍历首行的每个单元格
-            for col in range(len(df.columns)):
-                cell_value = df.iloc[0, col]
-                if cell_value.strip().isdigit():
-                    df.iloc[0, col] = '-1'
 
         df_processed = df.apply(lambda row: row.apply(replace_target_cell), axis=1)
 
@@ -140,8 +135,20 @@ def csv_to_txt(input_csv, output_txt):
         try:
             with open(output_txt, 'w', encoding='utf-8') as txtfile:
                 for row_idx, row in enumerate(tqdm(data, desc="转换进度", unit="行")):
-                    # 清洗每个单元格的空白，保留所有单元格（包括空单元格）
-                    cleaned_row = [cell.strip() if cell.strip() else '0' for cell in row]
+                    # ⭐ 关键修复：每个 CSV 单元格必须精确对应 1 个 TXT 值
+                    # 如果单元格有空格（未匹配的序列），只取第一个值
+                    # 确保 TXT 行列数 = CSV 行列数 = 原始影像行列数
+                    cleaned_row = []
+                    for cell in row:
+                        cell = cell.strip()
+                        if not cell:
+                            cleaned_row.append('0')
+                        elif ' ' in cell:
+                            # 序列未匹配，取第一个值（通常是分类值或0）
+                            first_val = cell.split()[0]
+                            cleaned_row.append(first_val)
+                        else:
+                            cleaned_row.append(cell)
                     txtfile.write(' '.join(cleaned_row) + '\n')
 
             print(f"CSV转TXT完成！结果已保存至：{output_txt}")
@@ -220,41 +227,47 @@ def txt_to_envi_with_metadata(txt_file_path, output_file_path, ref_tif_path=None
                         num_val = float(val)
                         numeric_vals.append(num_val)
                     except ValueError:
-                        continue  # 跳过非数字值
-                if numeric_vals:  # 只保留有数据的行
+                        numeric_vals.append(0.0)
+                if numeric_vals:
                     txt_rows.append(numeric_vals)
 
         if not txt_rows:
             print("TXT文件中没有找到有效的数字数据")
             return False
 
-        print(f"TXT数据行数: {len(txt_rows)}")
+        # ⭐ 修复：用 TXT 的实际尺寸，代替参考 TIF 的尺寸
+        txt_actual_rows = len(txt_rows)
+        txt_actual_cols = max(len(row) for row in txt_rows) if txt_rows else 0
+        print(f"TXT数据实际尺寸: {txt_actual_rows} 行 × {txt_actual_cols} 列")
 
-        # 创建与参考影像相同尺寸的数据矩阵，初始化为NoData值
-        data = np.full((ref_height, ref_width), -9999.0, dtype=np.float32)
-        print(f"创建输出矩阵尺寸: {ref_height} × {ref_width}")
+        # 验证尺寸是否合理（与参考 TIF 对比，超出时告警但不截断）
+        if ref_tif_path and os.path.exists(ref_tif_path):
+            if txt_actual_rows != ref_height or txt_actual_cols != ref_width:
+                print(f"⚠️  警告：TXT 尺寸 ({txt_actual_rows}×{txt_actual_cols}) "
+                      f"与参考 TIF ({ref_height}×{ref_width}) 不匹配！")
+                print(f"   将使用 TXT 实际尺寸输出，忽略参考 TIF 尺寸")
+                emit_geo_anyway = True
+            else:
+                emit_geo_anyway = False
+        else:
+            emit_geo_anyway = False
+
+        # ⭐ 用 TXT 的实际尺寸创建矩阵，彻底杜绝截断填充导致的条纹
+        output_height = txt_actual_rows
+        output_width = txt_actual_cols
+        data = np.full((output_height, output_width), -9999.0, dtype=np.float32)
+        print(f"创建输出矩阵尺寸: {output_height} × {output_width} (基于 TXT 实际数据)")
 
         # 将TXT数据按行填入输出矩阵
-        # 确保数据填充完整，避免出现噪点横线
-        rows_to_fill = min(len(txt_rows), ref_height)
-        cols_to_fill = min(max(len(row) for row in txt_rows) if txt_rows else 0, ref_width)
-
-        print(f"填充数据范围: {rows_to_fill} 行 × {cols_to_fill} 列")
-
-        for i in range(rows_to_fill):
+        for i in range(output_height):
             row_data = txt_rows[i]
-            # 确保每行都填充到cols_to_fill长度，不足的部分用0填充
-            if len(row_data) >= cols_to_fill:
-                data[i, :cols_to_fill] = row_data[:cols_to_fill]
+            actual_len = len(row_data)
+            if actual_len >= output_width:
+                data[i, :] = row_data[:output_width]
             else:
-                # 填充现有数据
-                data[i, :len(row_data)] = row_data
-                # 剩余部分用0填充
-                data[i, len(row_data):cols_to_fill] = 0
-
-        # 对于没有数据的行，使用0值填充，避免出现NoData噪点
-        for i in range(rows_to_fill, ref_height):
-            data[i, :cols_to_fill] = 0
+                data[i, :actual_len] = row_data
+                # 剩余部分保持 -9999 (NoData)，而非 0，避免将 NoData 误设为 0 类
+                data[i, actual_len:] = -9999.0
 
         # 确保输出目录存在
         output_dir = os.path.dirname(output_file_path)
@@ -268,12 +281,12 @@ def txt_to_envi_with_metadata(txt_file_path, output_file_path, ref_tif_path=None
                     output_file_path,
                     'w',
                     driver='ENVI',
-                    height=ref_height,
-                    width=ref_width,
+                    height=output_height,
+                    width=output_width,
                     count=1,
                     dtype=data.dtype,
-                    crs=crs,
-                    transform=transform,
+                    crs=crs if not emit_geo_anyway else None,  # 尺寸不同时不写地理信息
+                    transform=transform if not emit_geo_anyway else None,
                     nodata=-9999  # 设置NoData值
             ) as dst:
                 dst.write(data, 1)
@@ -292,8 +305,8 @@ def txt_to_envi_with_metadata(txt_file_path, output_file_path, ref_tif_path=None
             with open(hdr_file, 'w', encoding='utf-8') as f:
                 f.write('ENVI\n')
                 f.write(f'description = {{Use Rainbow color table for better visualization}}\n')
-                f.write(f'samples = {ref_width}\n')  # 列数
-                f.write(f'lines = {ref_height}\n')  # 行数
+                f.write(f'samples = {output_width}\n')  # 列数
+                f.write(f'lines = {output_height}\n')  # 行数
                 f.write(f'bands = 1\n')
                 f.write('header offset = 0\n')
                 f.write('file type = ENVI Standard\n')
@@ -301,8 +314,8 @@ def txt_to_envi_with_metadata(txt_file_path, output_file_path, ref_tif_path=None
                 f.write('interleave = bsq\n')
                 f.write('byte order = 0\n')
 
-                # 地理信息
-                if crs and transform:
+                # 地理信息（仅当尺寸匹配时写入，否则 NoData 区域的地理参考无意义）
+                if crs and transform and not emit_geo_anyway:
                     x_start = transform[2]
                     y_start = transform[5]
                     pixel_width = transform[0]
@@ -413,7 +426,7 @@ def main(input_csv, images_folder, output_dir, add_geo=True, max_sequence_length
     image_count, image_files = get_image_count_from_folder(images_folder)
     if image_count == 0:
         print("在影像图文件夹中未找到任何支持的影像文件")
-        print("支持的格式: .tif, .tiff, .img, .jpg, .jpeg, .png, .bmp, .gif")
+        print("支持的格式: .tif, .tiff, .img")
         return False
 
     print(f"\n检测到 {image_count} 个影像文件，将使用 {image_count} 作为目标序列长度")
